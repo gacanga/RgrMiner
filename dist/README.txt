@@ -48,10 +48,15 @@ coinbase paying the pool and a share target. RgrMiner submits every share as a f
   address is needed.
 - `getblocktemplate` with `gozero_pool: 1` and `gozero_share_work` (requested hashes per share, `share-work`,
   default 1e10 ≈ one share every 12 s on a P104-100); shares go back with `submitblock [block, {workid}]`.
+- Choosing `share-work`: the pool estimates your hashrate from the shares it receives, so few shares per second
+  make its graph jumpy. About 0.5 to 1 share per second is a good target: share-work ≈ total hashrate (H/s) × 1.25,
+  for example 5e9 for a rig of five P104-100 (about 4 GH/s). Rewards do not depend on it: the pool pays for the work.
 - TLS: the pool certificate and host name are verified against `ca-bundle.crt` (shipped in the zip); a connection
   that cannot be verified is refused.
-- Shares are sent by a separate thread: the GPUs never wait for the network. Shares found on a previous block or on
-  an expired job are dropped instead of being sent.
+- Shares are sent by separate threads (`share-threads`, default 4, each submission is one HTTPS request that can take
+  about 1 s): the GPUs never wait for the network. Shares found on a previous block or on an expired job are dropped
+  instead of being sent. The stats line shows the average submission time and the longest queue: if the queue keeps
+  growing, raise `share-work` or `share-threads`.
 - Optional: with a local RIGOR node (`auth-file`), RgrMiner checks the node tip every 250 ms and asks the pool for new
   work as soon as a block is found; otherwise it polls the pool every 3 s.
 - Pool rules (fee, payout scheme, minimum payment, confirmations) are set by the pool: read
@@ -82,7 +87,7 @@ Measured: about **670 MH/s per P104-100** at stock clocks, about **800 MH/s** wi
 ```
 rgrminer --config rgrminer.conf [--gpus 0,1] [--log file]
          --test | --bench 60 | --propose | --check-chain 5 | --help
-rgrminer --config rgrminer_pool.conf        (pool mode: --pool-url, --pool-user, --share-work, --ca-file)
+rgrminer --config rgrminer_pool.conf        (pool mode: --pool-url, --pool-user, --share-work, --share-threads, --ca-file)
 ```
 
 Keep the node RPC on `127.0.0.1` only. Never expose port 8761.

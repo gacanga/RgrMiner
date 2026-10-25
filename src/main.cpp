@@ -34,7 +34,7 @@
 #include <cmath>
 #include <cctype>
 
-#define RGR_VERSION "0.2.0"
+#define RGR_VERSION "0.2.1"
 
 /* ------------------------------------------------------------------ configuration */
 
@@ -62,8 +62,9 @@ struct Config {
 	std::string ca_file = "ca-bundle.crt";
 	int pool_poll_ms = 3000;         /* pool template poll period */
 	int tpl_max_age_s = 60;          /* switch to a fresh pool template after this age (pool: expires 120 s) */
-	int tip_watch_ms = 250;
-	int run_s = 0;                   /* stop after this many seconds (tests), 0 = run forever */          /* local node tip check (new block -> new pool work at once), 0 = off */
+	int tip_watch_ms = 250;          /* local node tip check (new block -> new pool work at once), 0 = off */
+	int share_threads = 4;           /* parallel share submissions (each one is a full HTTPS request) */
+	int run_s = 0;                   /* stop after this many seconds (tests), 0 = run forever */
 };
 
 static std::string trim(const std::string &s)
@@ -97,6 +98,7 @@ static bool set_opt(Config &c, std::string k, const std::string &v)
 	else if (k == "pool-poll-ms") c.pool_poll_ms = atoi(v.c_str());
 	else if (k == "template-max-age") c.tpl_max_age_s = atoi(v.c_str());
 	else if (k == "tip-watch-ms") c.tip_watch_ms = atoi(v.c_str());
+	else if (k == "share-threads") c.share_threads = atoi(v.c_str());
 	else if (k == "run-seconds") c.run_s = atoi(v.c_str());
 	else return false;
 	return true;
@@ -135,6 +137,7 @@ static void usage()
 		"  --pool-url https://rgr.pool.gozero.trade/rpc   --pool-user <rg1q address>.<worker>   [--pool-pass x]\n"
 		"  --share-work N         requested hashes per share (1e10)   --ca-file ca-bundle.crt (TLS verification)\n"
 		"  --pool-poll-ms N (3000)  --template-max-age S (60)  --tip-watch-ms N (250, needs the local node RPC)\n"
+		"  --share-threads N      parallel share submissions (4)\n"
 		"  --run-seconds S        stop after S seconds (tests)\n"
 		"modes: --test | --bench S | --propose | --check-chain N | (default) mining\n", RGR_VERSION);
 }
@@ -470,6 +473,7 @@ struct GpuStat {
 static std::vector<std::unique_ptr<GpuStat>> g_stats;
 static std::atomic<uint64_t> g_blocks_ok{ 0 }, g_blocks_rej{ 0 };
 static std::atomic<uint64_t> g_sh_ok{ 0 }, g_sh_rej{ 0 }, g_sh_stale{ 0 }, g_sh_blocks{ 0 };
+static std::atomic<uint64_t> g_sh_sent{ 0 }, g_sh_ms{ 0 }, g_sh_qmax{ 0 };   /* submissions, total ms, longest queue */
 static double g_start_s = 0;
 
 /* ------------------------------------------------------------------ submission */
@@ -519,6 +523,8 @@ static void queue_share(const std::shared_ptr<Template> &t, const uint8_t header
 		std::lock_guard<std::mutex> g(g_shq_m);
 		if (g_shq.size() > 256) g_shq.pop_front();       /* pool unreachable for a long time */
 		g_shq.push_back(s);
+		uint64_t q = g_shq.size();
+		if (q > g_sh_qmax) g_sh_qmax = q;
 	}
 	g_shq_cv.notify_one();
 }
@@ -544,7 +550,10 @@ static void share_thread()
 		std::string err;
 		bool ok = false;
 		for (int attempt = 0; attempt < 3 && !ok; attempt++) {
+			double t0 = now_s();
 			ok = g_pool.call("submitblock", "[\"" + hex + "\",{\"workid\":" + json_escape(s.t->workid) + "}]", r, err, 30);
+			g_sh_sent++;
+			g_sh_ms += (uint64_t)((now_s() - t0) * 1000.0);
 			if (!ok && err.rfind("RPC error", 0) == 0) break;      /* answered with an error: no retry */
 			if (!ok) std::this_thread::sleep_for(std::chrono::seconds(2));
 		}
@@ -926,9 +935,12 @@ static void stats_thread()
 		if (g_pool_mode) {
 			double el = now_s() - g_start_s;
 			double eff = el > 0 ? g_sh_ok.load() * g_cfg.share_work / el : 0;
-			LOG("%.1f MH/s total (%s) | pool: shares %llu ok, %llu rejected, %llu stale, %.0f MH/s from shares | height %lld diff %.1f | pool blocks by us %llu | hw errors %llu",
+			uint64_t ns = g_sh_sent.load();
+			double avg_ms = ns ? (double)g_sh_ms.load() / ns : 0;
+			uint64_t qmax = g_sh_qmax.exchange(0);
+			LOG("%.1f MH/s total (%s) | pool: shares %llu ok, %llu rejected, %llu stale, %.0f MH/s from shares, submit %.0f ms, queue max %llu | height %lld diff %.1f | pool blocks by us %llu | hw errors %llu",
 				tot / 1e6, per.c_str(), (unsigned long long)g_sh_ok.load(), (unsigned long long)g_sh_rej.load(), (unsigned long long)g_sh_stale.load(),
-				eff / 1e6, t ? (long long)t->height : 0LL, diff, (unsigned long long)g_sh_blocks.load(), (unsigned long long)wrong);
+				eff / 1e6, avg_ms, (unsigned long long)qmax, t ? (long long)t->height : 0LL, diff, (unsigned long long)g_sh_blocks.load(), (unsigned long long)wrong);
 		} else
 		LOG("%.1f MH/s total (%s) | height %lld diff %.1f | expected 1 block / %.1f h at this diff | blocks %llu accepted, %llu rejected | hw errors %llu",
 			tot / 1e6, per.c_str(), t ? (long long)t->height : 0LL, diff, eta_h,
@@ -949,20 +961,22 @@ static int mode_mine()
 			return 2;
 		}
 		if (g_cfg.share_work < 1e6) { LOG("--share-work too small"); return 2; }
+		if (g_cfg.share_threads < 1 || g_cfg.share_threads > 32) { LOG("--share-threads must be 1..32"); return 2; }
 	} else if (g_cfg.address.rfind("rg1q", 0) != 0) { LOG("--address must be a mainnet ORU address starting with rg1q"); return 2; }
 	std::vector<int> devs;
 	if (!open_gpus(devs)) return 3;
 	g_start_s = now_s();
 	if (g_pool_mode)
-		LOG("RgrMiner %s, POOL %s://%s%s as %s, share work %.3g, %zu GPU(s), tpb %d, batch 2^%d",
+		LOG("RgrMiner %s, POOL %s://%s%s as %s, share work %.3g, %d share sender(s), %zu GPU(s), tpb %d, batch 2^%d",
 			RGR_VERSION, g_pool.tls ? "https" : "http", g_pool.host.c_str(), g_pool.path.c_str(), g_cfg.pool_user.c_str(),
-			g_cfg.share_work, devs.size(), g_cfg.tpb, g_cfg.batch_log2);
+			g_cfg.share_work, g_cfg.share_threads, devs.size(), g_cfg.tpb, g_cfg.batch_log2);
 	else
 		LOG("RgrMiner %s, solo on %s:%d, payout %s, %zu GPU(s), tpb %d, batch 2^%d",
 			RGR_VERSION, g_cfg.rpc_host.c_str(), g_cfg.rpc_port, g_cfg.address.c_str(), devs.size(), g_cfg.tpb, g_cfg.batch_log2);
-	std::thread shq, tw;
+	std::vector<std::thread> shq;
+	std::thread tw;
 	if (g_pool_mode) {
-		shq = std::thread(share_thread);
+		for (int i = 0; i < g_cfg.share_threads; i++) shq.emplace_back(share_thread);
 		if (g_cfg.tip_watch_ms > 0 && !g_rpc.user.empty()) tw = std::thread(tip_watch_thread);
 	}
 	std::thread tt(template_thread);
@@ -979,7 +993,7 @@ static int mode_mine()
 	tt.join();
 	st.join();
 	g_shq_cv.notify_all();
-	if (shq.joinable()) shq.join();
+	for (auto &x : shq) x.join();
 	if (tw.joinable()) tw.join();
 	if (g_pool_mode) LOG("pool session end: shares %llu ok, %llu rejected, %llu stale", (unsigned long long)g_sh_ok.load(), (unsigned long long)g_sh_rej.load(), (unsigned long long)g_sh_stale.load());
 	return g_cfg.run_s > 0 ? 0 : 1;   /* the GPU threads never end normally: let the .bat restart us */

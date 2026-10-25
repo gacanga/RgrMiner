@@ -50,10 +50,15 @@ avec une coinbase qui paie la pool et une cible de part. RgrMiner soumet chaque 
   votre adresse publique est nécessaire.
 - `getblocktemplate` avec `gozero_pool: 1` et `gozero_share_work` (hashs demandés par part, `share-work`, défaut 1e10
   ≈ une part toutes les 12 s sur une P104-100) ; les parts repartent par `submitblock [bloc, {workid}]`.
+- Choix de `share-work` : la pool estime votre hashrate d'après les parts reçues, donc peu de parts par seconde donnent
+  une courbe en dents de scie. Visez environ 0,5 à 1 part par seconde : share-work ≈ hashrate total (H/s) × 1,25, par
+  exemple 5e9 pour un rig de cinq P104-100 (environ 4 GH/s). Les gains n'en dépendent pas : la pool paie le travail.
 - TLS : le certificat et le nom d'hôte de la pool sont vérifiés avec `ca-bundle.crt` (fourni dans le zip) ; une
   connexion non vérifiable est refusée.
-- Les parts sont envoyées par un fil séparé : les GPU n'attendent jamais le réseau. Les parts trouvées sur un bloc
-  précédent ou sur un travail expiré sont abandonnées au lieu d'être envoyées.
+- Les parts sont envoyées par des fils séparés (`share-threads`, 4 par défaut ; chaque envoi est une requête HTTPS qui
+  peut prendre environ 1 s) : les GPU n'attendent jamais le réseau. Les parts trouvées sur un bloc précédent ou sur un
+  travail expiré sont abandonnées au lieu d'être envoyées. La ligne de stats affiche le temps moyen d'envoi et la plus
+  longue file d'attente : si la file grandit sans cesse, augmentez `share-work` ou `share-threads`.
 - Facultatif : avec un nœud RIGOR local (`auth-file`), RgrMiner regarde le dernier bloc du nœud toutes les 250 ms et
   redemande du travail à la pool dès qu'un bloc est trouvé ; sinon il interroge la pool toutes les 3 s.
 - Les règles de la pool (frais, mode de paiement, paiement minimum, confirmations) sont fixées par la pool : lisez
@@ -85,7 +90,7 @@ Mesure : environ **670 MH/s par P104-100** aux fréquences d'origine, environ **
 ```
 rgrminer --config rgrminer.conf [--gpus 0,1] [--log fichier]
          --test | --bench 60 | --propose | --check-chain 5 | --help
-rgrminer --config rgrminer_pool.conf        (mode pool : --pool-url, --pool-user, --share-work, --ca-file)
+rgrminer --config rgrminer_pool.conf        (mode pool : --pool-url, --pool-user, --share-work, --share-threads, --ca-file)
 ```
 
 Gardez le RPC du nœud sur `127.0.0.1` uniquement. N'exposez jamais le port 8761.

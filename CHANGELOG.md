@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.1 — 2026-10-25
+- Pool mode: shares are submitted by several threads in parallel (`share-threads`, default 4). On the real pool one
+  submission takes about 1 s (one HTTPS request each), so a single sender could not keep up beyond about one share per
+  second: the queue grew and the shares still waiting at each new block were lost as stale.
+- Stats line: average submission time and longest share queue.
+- README and `rgrminer_pool.conf`: how to choose `share-work` (about 0.5 to 1 share per second).
+- `tests/fake_pool.py`: `FAKE_POOL_SUBMIT_MS` simulates a slow pool.
+
 ## 0.2.0 — 2026-10-25
 - **Pool mode for the Gozero pool** (`pool-url`, `pool-user`, `share-work`, `ca-file`, ...): pooled getblocktemplate over
   HTTPS, share target, `submitblock` with `workid`; certificate and host name verification (OpenSSL); shares sent by a
