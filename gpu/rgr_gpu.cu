@@ -2,8 +2,8 @@
  * RgrMiner - CUDA engine of the RIGOR proof of work (rgrpow01 / OpuHash), built as rgpu.dll
  *   SHA3-256("RGRPOW01" || header80) = one Keccak-f[1600] per nonce (see rgr_core.h).
  * Target: NVIDIA P104-100 (Pascal, sm_61).
- * Compile-time tuning: RGR_UNROLL (rounds per loop iteration, default 2), RGR_ROT (0 = funnel
- * shifts, 1 = shift + add), RGR_MINB (minimum blocks per SM for __launch_bounds__, default 2).
+ * Compile-time tuning: RGR_UNROLL (rounds per loop iteration, default 11), RGR_ROT (0 = funnel
+ * shifts, 1 = shift + add), RGR_MINB (minimum blocks per SM for __launch_bounds__, default 1).
  */
 #define RGPU_BUILD
 #include "rgr_gpu.h"
@@ -13,7 +13,7 @@
 #include <string.h>
 
 #ifndef RGR_UNROLL
-#define RGR_UNROLL 2
+#define RGR_UNROLL 11   /* measured on P104-100 (25/10/2026): 11 = +0.5 % vs 2; 22 is 42 % slower */
 #endif
 #ifndef RGR_ROT
 #define RGR_ROT 0

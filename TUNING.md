@@ -1,0 +1,64 @@
+# RgrMiner — tuning notes (NVIDIA P104-100 8 GB)
+
+> Français : [TUNING.fr.md](TUNING.fr.md)
+
+Measured on 2026-10-25 with RgrMiner 0.1.1 on five identical cards. Your cards, cooling and power supply may behave
+differently: change one step at a time and run `test.bat` after every change.
+
+## Hardware and software
+
+| Item | Value |
+|---|---|
+| GPU | **NVIDIA P104-100, 8 GB** (8192 MiB), Pascal GP104, 15 SM, compute capability 6.1 |
+| Default / min / max power limit | 180 W / 90 W / 217 W (`nvidia-smi --query-gpu=power.default_limit,power.min_limit,power.max_limit --format=csv`) |
+| Driver | NVIDIA 581.42 (Windows 10/11 x64) |
+| Build | CUDA 12.9, sm_61 native code, 512 threads per block, 2^27 nonces per launch |
+| Offsets | P0 clock offsets set through NVAPI (same meaning as the core / memory offset sliders of usual OC tools) |
+
+## Why these settings
+
+- SHA3 runs entirely in registers: each card uses about 97 MiB of memory and **memory speed does not matter**.
+  Lowering the memory clock frees power for the core.
+- At every step below the cards were **limited by their power limit**, so the hash rate follows the core clock
+  that the power budget allows.
+- Core offsets above +200 MHz are not safe on these cards: at +300 MHz three cards out of five produced wrong
+  hashes or "illegal memory access" errors in `--test`. RgrMiner re-checks every GPU against the CPU every
+  10 minutes (exit code 6 on a mismatch), but a frozen driver is not always recoverable without a reboot.
+
+## Results (5 cards, 45 s benchmark per step, `--test` passed after every step)
+
+| Core offset / memory offset / power limit | Total | Gain |
+|---|---|---|
+| 0 / 0 / 150 W (stock clocks, 150 W) | ≈ 3,355 MH/s | — |
+| 0 / −1000 MHz / 150 W | 3,442 MH/s | +2.6 % |
+| 0 / −1000 MHz / 180 W (default limit) | 3,627 MH/s | +8.1 % |
+| +100 / −1000 MHz / 180 W | 3,765 MH/s | +12.2 % |
+| +200 / −1000 MHz / 180 W | 3,912 MH/s | +16.6 % |
+| **+200 / −1000 MHz / 200 W** | **4,008 MH/s** | **+19.5 %** |
+
+Final setting, per card: 792 / 808 / 812 / 796 / 800 MH/s; 194–200 W; core 1923–1974 MHz;
+memory reported at 2999 MHz instead of 5005 MHz by `nvidia-smi`; 58–72 °C. The five cards were within 3 % of each
+other, so they all use the same setting.
+
+We stopped at 200 W instead of the 217 W maximum to keep the load on the power supplies reasonable. Size your
+power supply (and risers) for the limit you choose.
+
+## Kernel variants (one card, +200 / −1000 / 200 W)
+
+| Kernel build | MH/s |
+|---|---|
+| `RGR_UNROLL=2` (0.1.0) | 798–799 |
+| **`RGR_UNROLL=11` (0.1.1 default)** | **802–803** |
+| `RGR_UNROLL=22` (fully unrolled) | 461 |
+| `RGR_ROT=1` (shift + add rotations) | 797 |
+| `RGR_UNROLL=11`, `--tpb 256` | 787 |
+
+A fully unrolled loop is about 42 % slower: the code no longer fits the instruction cache. The kernel is close to
+the compute limit of the card, so clocks and power are the remaining levers.
+
+## How to apply
+
+1. Power limit (administrator): `nvidia-smi -i 0,1,2,3,4 -pl 200`
+2. Core +200 MHz, memory −1000 MHz with your overclocking tool.
+3. `test.bat` (must end with `TEST ALL OK`), then `bench.bat`, then mine. If a card reports `WRONG candidate` or
+   `SELF-CHECK FAILED`, lower its core offset to +100, then 0.

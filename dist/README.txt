@@ -43,7 +43,8 @@ and `docs/RGRPOW01_REFERENCE_VECTOR_v1.0.md` in the rigorchain repository (https
 - The official **RIGOR v0.2 mainnet** wallet / node running on the same computer and synchronized
   (release (https://github.com/rigorchain/rigorchain/releases/tag/v0.2-mainnet)).
 
-Measured: about **670 MH/s per P104-100** at stock clocks.
+Measured: about **670 MH/s per P104-100** at stock clocks, about **800 MH/s** with the settings of TUNING.md (TUNING.md)
+(core +200 MHz, memory −1000 MHz, 200 W).
 
 ## Quick start (release zip)
 
@@ -66,7 +67,7 @@ Keep the node RPC on `127.0.0.1` only. Never expose port 8761.
 - GPU DLL: CUDA 12.9 + Visual Studio 2022 → `windows\build_gpu_dll.bat` (sm_61 + PTX).
 - Host: MSYS2 MINGW64 g++ → `windows/build_host.sh` (links `rgpu.dll`, static, only ws2_32).
 - `build_all.bat` builds `dev\` and runs the tests (`run_test.bat`); `run_bench.bat` for a benchmark.
-- Kernel variants: `run\nvcc_extra.txt` (e.g. `-DRGR_UNROLL=1`, `-DRGR_ROT=1`).
+- Kernel variants: `run\nvcc_extra.txt` (e.g. `-DRGR_UNROLL=2`, `-DRGR_ROT=1`); default `RGR_UNROLL=11`.
 
 Tests without a GPU (Linux): `tests/core_test.cpp` (GPU code path emulated on the CPU vs reference SHA3-256),
 `tests/rg_stub.cpp` (CPU stand-in for `rgpu.dll`), `tests/fake_node.py` (fake rigord that checks every submitted

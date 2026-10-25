@@ -46,7 +46,8 @@ Keccak-f[1600]**. L'identifiant du bloc, la racine de Merkle et les txid restent
 - Le wallet / nœud officiel **RIGOR v0.2 mainnet** lancé sur le même ordinateur et synchronisé
   ([release](https://github.com/rigorchain/rigorchain/releases/tag/v0.2-mainnet)).
 
-Mesure : environ **670 MH/s par P104-100** aux fréquences d'origine.
+Mesure : environ **670 MH/s par P104-100** aux fréquences d'origine, environ **800 MH/s** avec les réglages de
+[TUNING.fr.md](TUNING.fr.md) (cœur +200 MHz, mémoire −1000 MHz, 200 W).
 
 ## Démarrage rapide (zip de la release)
 
@@ -69,7 +70,7 @@ Gardez le RPC du nœud sur `127.0.0.1` uniquement. N'exposez jamais le port 8761
 - DLL GPU : CUDA 12.9 + Visual Studio 2022 → `windows\build_gpu_dll.bat` (sm_61 + PTX).
 - Hôte : MSYS2 MINGW64 g++ → `windows/build_host.sh` (lié à `rgpu.dll`, statique, seulement ws2_32).
 - `build_all.bat` compile dans `dev\` et lance les tests (`run_test.bat`) ; `run_bench.bat` pour un banc d'essai.
-- Variantes du noyau : `run\nvcc_extra.txt` (par ex. `-DRGR_UNROLL=1`, `-DRGR_ROT=1`).
+- Variantes du noyau : `run\nvcc_extra.txt` (par ex. `-DRGR_UNROLL=2`, `-DRGR_ROT=1`) ; défaut `RGR_UNROLL=11`.
 
 Tests sans GPU (Linux) : `tests/core_test.cpp` (chemin GPU émulé sur le CPU contre la référence SHA3-256),
 `tests/rg_stub.cpp` (remplaçant CPU de `rgpu.dll`), `tests/fake_node.py` (faux rigord qui vérifie chaque bloc soumis :
