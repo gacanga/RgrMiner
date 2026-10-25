@@ -1,0 +1,8 @@
+dev/
+bin/
+logs/
+run/
+*.log
+*.obj
+*.exp
+*.lib
