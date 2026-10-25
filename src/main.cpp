@@ -4,12 +4,16 @@
  * Works against a LOCAL rigord (getblocktemplate / submitblock on 127.0.0.1:8761).  No dev fee.
  *
  * The node builds the coinbase (rigor_coinbase_immutable): only nNonce and nTime can change.
- * Each GPU takes its own nTime values (template time + slot counter, one slot = 2^32 nonces),
- * so no two cards ever hash the same header.
+ * Each GPU takes its own nTime values (one nTime = 2^32 nonces) from a process-wide counter kept
+ * per header (version, previous block, merkle root, bits), so no card ever hashes the same header
+ * twice, even when the same job is served again by the pool.
  *
  * Pool mode (Gozero, pool-url = https://rgr.pool.gozero.trade/rpc): the same getblocktemplate /
  * submitblock exchange over HTTPS with the pool fields gozero_pool / gozero_share_target / workid;
  * the coinbase pays the pool, shares (hash <= share target) are submitted as full blocks.
+ * The pool serves the same job (same workid, same curtime) until its transactions change and it
+ * silently ignores a share sent twice: the job is kept as long as the pool serves it, and the
+ * measured hashrate is reported to the pool (gozero_telemetry, display only).
  *
  * Modes:  (default) mining   --test   --bench <s>   --propose   --check-chain <n>
  * License: GPL-3.0 (see LICENSE).
@@ -34,7 +38,7 @@
 #include <cmath>
 #include <cctype>
 
-#define RGR_VERSION "0.2.1"
+#define RGR_VERSION "0.2.2"
 
 /* ------------------------------------------------------------------ configuration */
 
@@ -61,7 +65,8 @@ struct Config {
 	double share_work = 1e10;        /* requested hashes per share (gozero_share_work) */
 	std::string ca_file = "ca-bundle.crt";
 	int pool_poll_ms = 3000;         /* pool template poll period */
-	int tpl_max_age_s = 60;          /* switch to a fresh pool template after this age (pool: expires 120 s) */
+	int tpl_max_age_s = 60;          /* ignored since 0.2.2 (the pool job is kept while the pool serves it) */
+	bool report_hashrate = true;     /* pool: report the measured hashrate (gozero_telemetry, display only) */
 	int tip_watch_ms = 250;          /* local node tip check (new block -> new pool work at once), 0 = off */
 	int share_threads = 4;           /* parallel share submissions (each one is a full HTTPS request) */
 	int run_s = 0;                   /* stop after this many seconds (tests), 0 = run forever */
@@ -99,6 +104,7 @@ static bool set_opt(Config &c, std::string k, const std::string &v)
 	else if (k == "template-max-age") c.tpl_max_age_s = atoi(v.c_str());
 	else if (k == "tip-watch-ms") c.tip_watch_ms = atoi(v.c_str());
 	else if (k == "share-threads") c.share_threads = atoi(v.c_str());
+	else if (k == "report-hashrate") c.report_hashrate = atoi(v.c_str()) != 0;
 	else if (k == "run-seconds") c.run_s = atoi(v.c_str());
 	else return false;
 	return true;
@@ -136,8 +142,8 @@ static void usage()
 		"pool mode (Gozero):\n"
 		"  --pool-url https://rgr.pool.gozero.trade/rpc   --pool-user <rg1q address>.<worker>   [--pool-pass x]\n"
 		"  --share-work N         requested hashes per share (1e10)   --ca-file ca-bundle.crt (TLS verification)\n"
-		"  --pool-poll-ms N (3000)  --template-max-age S (60)  --tip-watch-ms N (250, needs the local node RPC)\n"
-		"  --share-threads N      parallel share submissions (4)\n"
+		"  --pool-poll-ms N (3000)  --tip-watch-ms N (250, needs the local node RPC)\n"
+		"  --share-threads N      parallel share submissions (4)   --report-hashrate 0|1 (1: shown by the pool, no effect on rewards)\n"
 		"  --run-seconds S        stop after S seconds (tests)\n"
 		"modes: --test | --bench S | --propose | --check-chain N | (default) mining\n", RGR_VERSION);
 }
@@ -168,9 +174,9 @@ struct Template {
 	int64_t coinbasevalue = 0;
 	size_t ntx = 0;
 	std::string txs_hex;                /* compactsize(n) + coinbase + transactions */
-	std::atomic<uint32_t> slot{ 0 };    /* next nTime slot */
+	std::string hkey;                   /* header without nTime / nonce: key of the nTime counter */
 	std::atomic<bool> solved{ false };  /* a block was accepted on this template */
-	double fetched_at = 0;
+	std::atomic<double> fetched_at{ 0 };  /* last time the pool served this job */
 };
 
 static std::mutex g_tpl_m;
@@ -180,6 +186,26 @@ static std::atomic<double> g_last_ok{ 0 };
 static std::mutex g_poll_m;
 static std::condition_variable g_poll_cv;
 static std::atomic<bool> g_poll_now{ false };
+
+/* highest nTime handed out per header (without nTime / nonce), for the whole process: a job served
+   again (same workid, same curtime) or rebuilt never makes a card hash a header a second time */
+static std::mutex g_ntime_m;
+static std::map<std::string, int64_t> g_ntime_hw;
+
+static bool take_ntime(const Template &t, int64_t &ntime)
+{
+	std::lock_guard<std::mutex> g(g_ntime_m);
+	auto it = g_ntime_hw.find(t.hkey);
+	int64_t c = t.base_time;
+	if (it != g_ntime_hw.end() && it->second + 1 > c) c = it->second + 1;
+	if (c > t.maxtime || c > unix_now() + g_cfg.max_ahead_s) return false;
+	if (it == g_ntime_hw.end()) {
+		if (g_ntime_hw.size() >= 256) g_ntime_hw.clear();   /* old jobs: their blocks are long gone */
+		g_ntime_hw[t.hkey] = c;
+	} else it->second = c;
+	ntime = c;
+	return true;
+}
 
 static std::shared_ptr<Template> current_tpl()
 {
@@ -290,13 +316,13 @@ static bool hex32_rev(const std::string &h, uint8_t out[32])
 	return true;
 }
 
-static std::string gbt_params(const char *mode = nullptr, const std::string &data = "")
+static std::string gbt_params(const char *mode = nullptr, const std::string &data = "", const std::string &telemetry = "")
 {
 	if (mode) return std::string("[{\"mode\":\"") + mode + "\",\"data\":\"" + data + "\",\"rules\":[\"segwit\"]}]";
 	if (g_pool_mode) {
 		char w[64];
 		snprintf(w, sizeof(w), "%.0f", g_cfg.share_work);
-		return std::string("[{\"gozero_pool\":1,\"gozero_share_work\":") + w +
+		return std::string("[{\"gozero_pool\":1,\"gozero_share_work\":") + w + telemetry +
 			",\"capabilities\":[\"coinbasevalue\",\"longpoll\",\"workid\"],\"rules\":[\"segwit\"]}]";
 	}
 	return "[{\"rules\":[\"segwit\"],\"capabilities\":[\"coinbasevalue\",\"longpoll\"],\"coinbase_address\":" + json_escape(g_cfg.address) + "}]";
@@ -346,7 +372,9 @@ static bool build_template(const JVal &r, Template &t, std::string &err)
 		if (cmp < 0) { err = "share target harder than the block target"; return false; }
 		memcpy(t.gpu_target, w, sizeof(w));
 	}
-	t.base_time = std::max(curtime, mintime);
+	/* the pool keeps curtime for the whole job: start from the clock so that a restart does not
+	   go back over nTime values already used (the GPUs use about one nTime per second) */
+	t.base_time = std::max(std::max(curtime, mintime), std::min(unix_now(), t.maxtime));
 
 	/* coinbase: copy the node bytes, check its txid */
 	std::vector<uint8_t> cb, cb_nw;
@@ -381,19 +409,23 @@ static bool build_template(const JVal &r, Template &t, std::string &err)
 	put_le32(t.header + 68, (uint32_t)t.base_time);
 	put_le32(t.header + 72, t.bits);
 	put_le32(t.header + 76, 0);
+	t.hkey.assign((const char *)t.header, 68);
+	t.hkey.append((const char *)t.header + 72, 4);
 	return true;
 }
 
-static bool fetch_template(std::shared_ptr<Template> &out, std::string &err)
+static bool fetch_template(std::shared_ptr<Template> &out, std::string &err, const std::string &telemetry = "")
 {
 	JVal r;
-	if (!(g_pool_mode ? g_pool : g_rpc).call("getblocktemplate", gbt_params(), r, err, 20)) return false;
+	if (!(g_pool_mode ? g_pool : g_rpc).call("getblocktemplate", gbt_params(nullptr, "", telemetry), r, err, 20)) return false;
 	auto t = std::make_shared<Template>();
 	if (!build_template(r, *t, err)) return false;
 	t->fetched_at = now_s();
 	out = t;
 	return true;
 }
+
+static std::string telemetry_param();
 
 static void template_thread()
 {
@@ -402,13 +434,17 @@ static void template_thread()
 	while (!g_stop) {
 		std::shared_ptr<Template> t;
 		std::string err;
-		if (fetch_template(t, err)) {
+		std::string tel = g_pool_mode ? telemetry_param() : std::string();
+		if (fetch_template(t, err, tel)) {
 			g_last_ok = now_s();
 			if (!last_err.empty()) { LOG("node OK again"); last_err.clear(); }
 			auto cur = current_tpl();
 			bool change = !cur || cur->prevhash != t->prevhash;
-			if (!change && g_pool_mode) change = now_s() - cur->fetched_at > std::min((double)g_cfg.tpl_max_age_s, cur->expires_s * 0.75);
-			else if (!change) change = cur->longpollid != t->longpollid;
+			if (!change && g_pool_mode) {
+				/* same job served again: keep it (rebuilding it would not give new work) */
+				change = cur->workid != t->workid || cur->hkey != t->hkey;
+				if (!change) cur->fetched_at = t->fetched_at.load();
+			} else if (!change) change = cur->longpollid != t->longpollid;
 			if (change) {
 				bool new_block = !cur || cur->prevhash != t->prevhash;
 				t->id = g_tpl_id + 1;
@@ -471,6 +507,38 @@ struct GpuStat {
 	std::string name;
 };
 static std::vector<std::unique_ptr<GpuStat>> g_stats;
+
+/* pool: measured hashrate of all the GPUs since the previous report (at least 5 s), sent with the
+   next getblocktemplate (gozero_telemetry, like the pool's own miner); the pool shows it as the
+   local hashrate, forgets it after 20 s and never uses it for rewards */
+static std::string telemetry_param()
+{
+	static double last_t = 0;
+	static uint64_t last_h = 0;
+	if (!g_cfg.report_hashrate || g_stats.empty()) return "";
+	auto cur = current_tpl();
+	if (!cur || cur->workid.empty()) return "";
+	double now = now_s();
+	uint64_t h = 0;
+	for (auto &st : g_stats) h += st->hashes.load();
+	if (last_t == 0 || h < last_h) { last_t = now; last_h = h; return ""; }
+	if (now - last_t < 5) return "";
+	double hs = (double)(h - last_h) / (now - last_t);
+	last_t = now;
+	last_h = h;
+	std::map<std::string, int> models;
+	for (auto &st : g_stats) {
+		std::string n = st->name.substr(0, st->name.find(" ("));
+		models[n]++;
+	}
+	std::string dev;
+	for (auto &m : models) dev += (dev.empty() ? "" : ", ") + std::to_string(m.second) + "x " + m.first;
+	if (dev.size() > 96) dev.resize(96);
+	char b[64];
+	snprintf(b, sizeof(b), "%.0f", hs);
+	return std::string(",\"gozero_telemetry\":{\"hashrate_hs\":") + b + ",\"workid\":" + json_escape(cur->workid) +
+		",\"device\":" + json_escape(dev) + ",\"client\":" + json_escape(std::string("RgrMiner/") + RGR_VERSION) + "}";
+}
 static std::atomic<uint64_t> g_blocks_ok{ 0 }, g_blocks_rej{ 0 };
 static std::atomic<uint64_t> g_sh_ok{ 0 }, g_sh_rej{ 0 }, g_sh_stale{ 0 }, g_sh_blocks{ 0 };
 static std::atomic<uint64_t> g_sh_sent{ 0 }, g_sh_ms{ 0 }, g_sh_qmax{ 0 };   /* submissions, total ms, longest queue */
@@ -622,11 +690,9 @@ static void gpu_thread(int idx, int dev)
 	while (!g_stop) {
 		auto t = current_tpl();
 		if (!t || now_s() - g_last_ok > 30) { std::this_thread::sleep_for(std::chrono::milliseconds(200)); continue; }
-		const uint32_t slot = t->slot.fetch_add(1);
-		const int64_t ntime = t->base_time + slot;
-		if (ntime > t->maxtime || ntime > unix_now() + g_cfg.max_ahead_s) {
+		int64_t ntime = 0;
+		if (!take_ntime(*t, ntime)) {
 			/* nTime space of this template used up: wait for a refresh */
-			t->slot.fetch_sub(1);
 			poll_now();
 			std::this_thread::sleep_for(std::chrono::milliseconds(500));
 			continue;
@@ -967,9 +1033,9 @@ static int mode_mine()
 	if (!open_gpus(devs)) return 3;
 	g_start_s = now_s();
 	if (g_pool_mode)
-		LOG("RgrMiner %s, POOL %s://%s%s as %s, share work %.3g, %d share sender(s), %zu GPU(s), tpb %d, batch 2^%d",
+		LOG("RgrMiner %s, POOL %s://%s%s as %s, share work %.3g, %d share sender(s), hashrate report %s, %zu GPU(s), tpb %d, batch 2^%d",
 			RGR_VERSION, g_pool.tls ? "https" : "http", g_pool.host.c_str(), g_pool.path.c_str(), g_cfg.pool_user.c_str(),
-			g_cfg.share_work, g_cfg.share_threads, devs.size(), g_cfg.tpb, g_cfg.batch_log2);
+			g_cfg.share_work, g_cfg.share_threads, g_cfg.report_hashrate ? "on" : "off", devs.size(), g_cfg.tpb, g_cfg.batch_log2);
 	else
 		LOG("RgrMiner %s, solo on %s:%d, payout %s, %zu GPU(s), tpb %d, batch 2^%d",
 			RGR_VERSION, g_cfg.rpc_host.c_str(), g_cfg.rpc_port, g_cfg.address.c_str(), devs.size(), g_cfg.tpb, g_cfg.batch_log2);

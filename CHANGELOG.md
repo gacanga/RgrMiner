@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.2 — 2026-10-25
+- **Pool mode fix: duplicate shares.** The Gozero pool serves the same job (same `workid`, same `curtime`) until its
+  transactions change and silently ignores a share sent twice (answer `null`, not counted). 0.2.0 / 0.2.1 rebuilt the
+  job every 60 s from the same time, so the cards hashed the same headers again: about 25-30 % of the "accepted" shares
+  were not credited by the pool. Now the job is kept while the pool serves it, and every nTime comes from one counter
+  per header (version, previous block, merkle root, bits) for the whole run, starting from the clock. Reproduced and
+  checked with `tests/fake_pool.py` (`FAKE_POOL_JOB_S`, `FAKE_POOL_SILENT_DUP`): 43 duplicates out of 54 shares with
+  0.2.1, 0 with 0.2.2.
+- Hashrate report to the pool (`report-hashrate`, default 1): `gozero_telemetry` (measured hashrate, device, client)
+  with `getblocktemplate`, every 5 s or more. Display only on the pool side.
+- `template-max-age` is no longer used.
+
 ## 0.2.1 — 2026-10-25
 - Pool mode: shares are submitted by several threads in parallel (`share-threads`, default 4). On the real pool one
   submission takes about 1 s (one HTTPS request each), so a single sender could not keep up beyond about one share per

@@ -57,6 +57,13 @@ coinbase paying the pool and a share target. RgrMiner submits every share as a f
   about 1 s): the GPUs never wait for the network. Shares found on a previous block or on an expired job are dropped
   instead of being sent. The stats line shows the average submission time and the longest queue: if the queue keeps
   growing, raise `share-work` or `share-threads`.
+- The pool serves the same job (same `workid`, same time) until its transactions change, and it answers `null` to a
+  share sent twice without counting it again. RgrMiner keeps the job while the pool serves it and takes every nTime
+  from one counter per header for the whole run, so a card never hashes the same header twice (0.2.0 and 0.2.1 rebuilt
+  the job every 60 s from the same time and sent about 25-30 % of duplicate shares that the pool did not count).
+- Hashrate report (`report-hashrate = 1`, default): the measured hashrate of the GPUs is sent with the next
+  `getblocktemplate` every 5 s or more (`gozero_telemetry`, like the pool's own miner). The pool shows it as the local
+  hashrate; it never changes the rewards, which only depend on the accepted shares.
 - Optional: with a local RIGOR node (`auth-file`), RgrMiner checks the node tip every 250 ms and asks the pool for new
   work as soon as a block is found; otherwise it polls the pool every 3 s.
 - Pool rules (fee, payout scheme, minimum payment, confirmations) are set by the pool: read
@@ -87,7 +94,7 @@ Measured: about **670 MH/s per P104-100** at stock clocks, about **800 MH/s** wi
 ```
 rgrminer --config rgrminer.conf [--gpus 0,1] [--log file]
          --test | --bench 60 | --propose | --check-chain 5 | --help
-rgrminer --config rgrminer_pool.conf        (pool mode: --pool-url, --pool-user, --share-work, --share-threads, --ca-file)
+rgrminer --config rgrminer_pool.conf        (pool mode: --pool-url, --pool-user, --share-work, --share-threads, --report-hashrate, --ca-file)
 ```
 
 Keep the node RPC on `127.0.0.1` only. Never expose port 8761.

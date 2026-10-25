@@ -59,6 +59,14 @@ avec une coinbase qui paie la pool et une cible de part. RgrMiner soumet chaque 
   peut prendre environ 1 s) : les GPU n'attendent jamais le réseau. Les parts trouvées sur un bloc précédent ou sur un
   travail expiré sont abandonnées au lieu d'être envoyées. La ligne de stats affiche le temps moyen d'envoi et la plus
   longue file d'attente : si la file grandit sans cesse, augmentez `share-work` ou `share-threads`.
+- La pool sert le même travail (même `workid`, même heure) tant que ses transactions ne changent pas, et répond `null` à
+  une part envoyée deux fois sans la compter une seconde fois. RgrMiner garde le travail tant que la pool le sert et
+  prend chaque nTime dans un compteur par en-tête valable pour toute la session : une carte ne calcule jamais deux fois
+  le même en-tête (la 0.2.0 et la 0.2.1 reconstruisaient le travail toutes les 60 s à partir de la même heure et
+  envoyaient environ 25 à 30 % de parts en double que la pool ne comptait pas).
+- Hashrate déclaré (`report-hashrate = 1`, par défaut) : le hashrate mesuré des cartes est envoyé avec le
+  `getblocktemplate` suivant, toutes les 5 s ou plus (`gozero_telemetry`, comme le mineur de la pool). La pool l'affiche
+  comme hashrate local ; il ne change jamais les gains, qui ne dépendent que des parts acceptées.
 - Facultatif : avec un nœud RIGOR local (`auth-file`), RgrMiner regarde le dernier bloc du nœud toutes les 250 ms et
   redemande du travail à la pool dès qu'un bloc est trouvé ; sinon il interroge la pool toutes les 3 s.
 - Les règles de la pool (frais, mode de paiement, paiement minimum, confirmations) sont fixées par la pool : lisez
@@ -90,7 +98,7 @@ Mesure : environ **670 MH/s par P104-100** aux fréquences d'origine, environ **
 ```
 rgrminer --config rgrminer.conf [--gpus 0,1] [--log fichier]
          --test | --bench 60 | --propose | --check-chain 5 | --help
-rgrminer --config rgrminer_pool.conf        (mode pool : --pool-url, --pool-user, --share-work, --share-threads, --ca-file)
+rgrminer --config rgrminer_pool.conf        (mode pool : --pool-url, --pool-user, --share-work, --share-threads, --report-hashrate, --ca-file)
 ```
 
 Gardez le RPC du nœud sur `127.0.0.1` uniquement. N'exposez jamais le port 8761.
