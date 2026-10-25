@@ -7,7 +7,10 @@ Open-source NVIDIA GPU **solo** miner for **RIGOR** (ORU, [rigorchain.com](https
 
 The official RIGOR v0.2 mainnet release only ships a CPU miner. RgrMiner computes the same proof of work on the GPU and
 talks to **your own local RIGOR node** exactly like the official miner does (`getblocktemplate` / `submitblock` on
-`127.0.0.1:8761`). There is no pool: every block you find pays 128 ORU (+ fees) to your address.
+`127.0.0.1:8761`): every block you find pays 128 ORU (+ fees) to your address.
+
+Since 0.2.0 it can also mine on the **Gozero pool** ([pool.gozero.trade/ORU](https://pool.gozero.trade/ORU)), which shares
+the rewards between its miners (see [Pool mode](#pool-mode-gozero)).
 
 ## Proof of work
 
@@ -36,17 +39,38 @@ and `docs/RGRPOW01_REFERENCE_VECTOR_v1.0.md` in the [rigorchain repository](http
 - **Self-check**: at start and every 10 minutes each GPU recomputes 4,096 digests against the CPU reference; a
   mismatch (unstable overclock...) stops the miner with exit code 6.
 
+## Pool mode (Gozero)
+
+The Gozero pool does not use Stratum: it serves RIGOR block templates over HTTPS (JSON-RPC, "pooled-GBT"), with a
+coinbase paying the pool and a share target. RgrMiner submits every share as a full block.
+
+- Endpoint `https://rgr.pool.gozero.trade/rpc`, user `<your rg1q address>.<worker>`, password `x`. Only your public
+  address is needed.
+- `getblocktemplate` with `gozero_pool: 1` and `gozero_share_work` (requested hashes per share, `share-work`,
+  default 1e10 ≈ one share every 12 s on a P104-100); shares go back with `submitblock [block, {workid}]`.
+- TLS: the pool certificate and host name are verified against `ca-bundle.crt` (shipped in the zip); a connection
+  that cannot be verified is refused.
+- Shares are sent by a separate thread: the GPUs never wait for the network. Shares found on a previous block or on
+  an expired job are dropped instead of being sent.
+- Optional: with a local RIGOR node (`auth-file`), RgrMiner checks the node tip every 250 ms and asks the pool for new
+  work as soon as a block is found; otherwise it polls the pool every 3 s.
+- Pool rules (fee, payout scheme, minimum payment, confirmations) are set by the pool: read
+  [pool.gozero.trade/ORU](https://pool.gozero.trade/ORU) before mining. RgrMiner is not affiliated with the pool.
+
+Quick start: edit `rgrminer_pool.conf` (`pool-user = rg1q....rig01`), run `test.bat`, then `start_pool.bat`.
+
 ## Requirements
 
 - Windows 10/11 x64, NVIDIA Pascal (sm_61: P104-100, GTX 1070/1080) or newer GPU, NVIDIA driver with CUDA 12
   support (R525 or newer). Newer GPUs run the PTX through the driver JIT (works, not tuned).
-- The official **RIGOR v0.2 mainnet** wallet / node running on the same computer and synchronized
-  ([release](https://github.com/rigorchain/rigorchain/releases/tag/v0.2-mainnet)).
+- Solo mining: the official **RIGOR v0.2 mainnet** wallet / node running on the same computer and synchronized
+  ([release](https://github.com/rigorchain/rigorchain/releases/tag/v0.2-mainnet)). Pool mining: only a receive address
+  (a local node is optional).
 
 Measured: about **670 MH/s per P104-100** at stock clocks, about **800 MH/s** with the settings of [TUNING.md](TUNING.md)
 (core +200 MHz, memory −1000 MHz, 200 W).
 
-## Quick start (release zip)
+## Quick start, solo (release zip)
 
 1. Start the RIGOR mainnet wallet / node, wait until it is synchronized, copy a receive address (`rg1q...`).
 2. Edit `rgrminer.conf`: `address = rg1q...` and `auth-file = <node data folder>\rpc-auth.conf`
@@ -58,6 +82,7 @@ Measured: about **670 MH/s per P104-100** at stock clocks, about **800 MH/s** wi
 ```
 rgrminer --config rgrminer.conf [--gpus 0,1] [--log file]
          --test | --bench 60 | --propose | --check-chain 5 | --help
+rgrminer --config rgrminer_pool.conf        (pool mode: --pool-url, --pool-user, --share-work, --ca-file)
 ```
 
 Keep the node RPC on `127.0.0.1` only. Never expose port 8761.
@@ -65,16 +90,18 @@ Keep the node RPC on `127.0.0.1` only. Never expose port 8761.
 ## Building
 
 - GPU DLL: CUDA 12.9 + Visual Studio 2022 → `windows\build_gpu_dll.bat` (sm_61 + PTX).
-- Host: MSYS2 MINGW64 g++ → `windows/build_host.sh` (links `rgpu.dll`, static, only ws2_32).
+- Host: MSYS2 MINGW64 g++ + OpenSSL (`mingw-w64-x86_64-openssl`) → `windows/build_host.sh` (links `rgpu.dll`,
+  static); `-DRGR_NO_TLS` builds a solo-only host without OpenSSL.
 - `build_all.bat` builds `dev\` and runs the tests (`run_test.bat`); `run_bench.bat` for a benchmark.
 - Kernel variants: `run\nvcc_extra.txt` (e.g. `-DRGR_UNROLL=2`, `-DRGR_ROT=1`); default `RGR_UNROLL=11`.
 
 Tests without a GPU (Linux): `tests/core_test.cpp` (GPU code path emulated on the CPU vs reference SHA3-256),
 `tests/rg_stub.cpp` (CPU stand-in for `rgpu.dll`), `tests/fake_node.py` (fake rigord that checks every submitted
-block: structure, merkle root, time window, proof of work), `tools/nvrtc_check.py` (NVRTC + ptxas register report).
+block: structure, merkle root, time window, proof of work), `tests/fake_pool.py` (fake Gozero pool over HTTPS with a
+self-signed certificate: auth, workid, block structure, share target), `tools/nvrtc_check.py` (NVRTC + ptxas register report).
 
 ```
-g++ -O2 -std=gnu++17 -Isrc -Igpu -o rgrminer_stub src/main.cpp tests/rg_stub.cpp -pthread
+g++ -O2 -std=gnu++17 -Isrc -Igpu -o rgrminer_stub src/main.cpp tests/rg_stub.cpp -lssl -lcrypto -pthread
 ./rgrminer_stub --test --tpb 256 --batch 20
 python3 tests/fake_node.py 18761 1f00ffff rg1qtest &
 ./rgrminer_stub --rpc-port 18761 --rpc-user tuser --rpc-pass tpass --address rg1qtest --tpb 256 --batch 20
@@ -82,5 +109,6 @@ python3 tests/fake_node.py 18761 1f00ffff rg1qtest &
 
 ## License
 
-GPL-3.0 (see `LICENSE`). The Keccak helpers come from the sha3-256t core of FjarMiner (GPL-3.0).
-RgrMiner is an independent project, not affiliated with the RIGOR developers. Mining gives no guaranteed reward.
+GPL-3.0 (see `LICENSE`). The Keccak helpers come from the sha3-256t core of FjarMiner (GPL-3.0). The Windows host is
+statically linked with OpenSSL 3 (Apache-2.0).
+RgrMiner is an independent project, not affiliated with the RIGOR developers nor with the Gozero pool. Mining gives no guaranteed reward.

@@ -7,6 +7,10 @@
  * Each GPU takes its own nTime values (template time + slot counter, one slot = 2^32 nonces),
  * so no two cards ever hash the same header.
  *
+ * Pool mode (Gozero, pool-url = https://rgr.pool.gozero.trade/rpc): the same getblocktemplate /
+ * submitblock exchange over HTTPS with the pool fields gozero_pool / gozero_share_target / workid;
+ * the coinbase pays the pool, shares (hash <= share target) are submitted as full blocks.
+ *
  * Modes:  (default) mining   --test   --bench <s>   --propose   --check-chain <n>
  * License: GPL-3.0 (see LICENSE).
  */
@@ -26,10 +30,11 @@
 #include <sstream>
 #include <algorithm>
 #include <array>
+#include <deque>
 #include <cmath>
 #include <cctype>
 
-#define RGR_VERSION "0.1.1"
+#define RGR_VERSION "0.2.0"
 
 /* ------------------------------------------------------------------ configuration */
 
@@ -49,6 +54,16 @@ struct Config {
 	std::string mode = "mine";
 	int bench_s = 30;
 	int check_n = 5;
+	/* pool mode */
+	std::string pool_url;            /* https://rgr.pool.gozero.trade/rpc ; empty = solo on the local node */
+	std::string pool_user;           /* <rg1q address>.<worker> */
+	std::string pool_pass = "x";
+	double share_work = 1e10;        /* requested hashes per share (gozero_share_work) */
+	std::string ca_file = "ca-bundle.crt";
+	int pool_poll_ms = 3000;         /* pool template poll period */
+	int tpl_max_age_s = 60;          /* switch to a fresh pool template after this age (pool: expires 120 s) */
+	int tip_watch_ms = 250;
+	int run_s = 0;                   /* stop after this many seconds (tests), 0 = run forever */          /* local node tip check (new block -> new pool work at once), 0 = off */
 };
 
 static std::string trim(const std::string &s)
@@ -74,6 +89,15 @@ static bool set_opt(Config &c, std::string k, const std::string &v)
 	else if (k == "selfcheck") c.selfcheck_min = atoi(v.c_str());
 	else if (k == "max-ahead") c.max_ahead_s = atoi(v.c_str());
 	else if (k == "log") c.log = v;
+	else if (k == "pool-url") c.pool_url = v;
+	else if (k == "pool-user") c.pool_user = v;
+	else if (k == "pool-pass") c.pool_pass = v;
+	else if (k == "share-work") c.share_work = atof(v.c_str());
+	else if (k == "ca-file") c.ca_file = v;
+	else if (k == "pool-poll-ms") c.pool_poll_ms = atoi(v.c_str());
+	else if (k == "template-max-age") c.tpl_max_age_s = atoi(v.c_str());
+	else if (k == "tip-watch-ms") c.tip_watch_ms = atoi(v.c_str());
+	else if (k == "run-seconds") c.run_s = atoi(v.c_str());
 	else return false;
 	return true;
 }
@@ -96,7 +120,7 @@ static bool load_kv_file(const std::string &path, std::vector<std::pair<std::str
 static void usage()
 {
 	printf(
-		"RgrMiner %s - GPU solo miner for RIGOR (ORU, rgrpow01 / OpuHash), no dev fee\n"
+		"RgrMiner %s - GPU miner for RIGOR (ORU, rgrpow01 / OpuHash): solo on a local node or Gozero pool, no dev fee\n"
 		"usage: rgrminer [--config file] [--args-file file] [options] [mode]\n"
 		"  --address rg1q...      payout address (ORU, witness v0) sent as coinbase_address\n"
 		"  --rpc-host / --rpc-port local rigord RPC (127.0.0.1 / 8761)\n"
@@ -107,13 +131,20 @@ static void usage()
 		"  --poll-ms N            getblocktemplate poll period (500)\n"
 		"  --stats S              hashrate report period (60)  --selfcheck M  GPU self-check period, 0 = off (10)\n"
 		"  --log file             append the log to file\n"
+		"pool mode (Gozero):\n"
+		"  --pool-url https://rgr.pool.gozero.trade/rpc   --pool-user <rg1q address>.<worker>   [--pool-pass x]\n"
+		"  --share-work N         requested hashes per share (1e10)   --ca-file ca-bundle.crt (TLS verification)\n"
+		"  --pool-poll-ms N (3000)  --template-max-age S (60)  --tip-watch-ms N (250, needs the local node RPC)\n"
+		"  --run-seconds S        stop after S seconds (tests)\n"
 		"modes: --test | --bench S | --propose | --check-chain N | (default) mining\n", RGR_VERSION);
 }
 
 /* ------------------------------------------------------------------ globals */
 
 static Config g_cfg;
-static Rpc g_rpc;
+static Rpc g_rpc;                       /* local node (solo; tip watch in pool mode) */
+static Rpc g_pool;                      /* Gozero pool (pool mode) */
+static bool g_pool_mode = false;
 static std::atomic<bool> g_stop{ false };
 
 /* ------------------------------------------------------------------ block template */
@@ -124,7 +155,11 @@ struct Template {
 	std::string longpollid;
 	int64_t height = 0;
 	uint8_t header[80];                 /* nTime = template time, nonce 0 */
-	uint32_t target[8];                 /* little-endian words */
+	uint32_t target[8];                 /* block target, little-endian words */
+	uint32_t gpu_target[8];             /* what the GPUs look for: share target (pool) or block target */
+	std::string workid;                 /* pool: sent back with every share */
+	std::string pool_address;           /* pool: coinbase payee */
+	double expires_s = 120;
 	uint32_t bits = 0;
 	int64_t base_time = 0, maxtime = 0;
 	int64_t coinbasevalue = 0;
@@ -255,6 +290,12 @@ static bool hex32_rev(const std::string &h, uint8_t out[32])
 static std::string gbt_params(const char *mode = nullptr, const std::string &data = "")
 {
 	if (mode) return std::string("[{\"mode\":\"") + mode + "\",\"data\":\"" + data + "\",\"rules\":[\"segwit\"]}]";
+	if (g_pool_mode) {
+		char w[64];
+		snprintf(w, sizeof(w), "%.0f", g_cfg.share_work);
+		return std::string("[{\"gozero_pool\":1,\"gozero_share_work\":") + w +
+			",\"capabilities\":[\"coinbasevalue\",\"longpoll\",\"workid\"],\"rules\":[\"segwit\"]}]";
+	}
 	return "[{\"rules\":[\"segwit\"],\"capabilities\":[\"coinbasevalue\",\"longpoll\"],\"coinbase_address\":" + json_escape(g_cfg.address) + "}]";
 }
 
@@ -264,7 +305,14 @@ static bool build_template(const JVal &r, Template &t, std::string &err)
 	if (r.t != JVal::OBJ) { err = "template is not an object"; return false; }
 	const JVal *imm = r.get("rigor_coinbase_immutable");
 	if (!imm || imm->t != JVal::BOOL || !imm->b) { err = "rigor_coinbase_immutable missing or false"; return false; }
-	if (r.str("coinbase_address") != g_cfg.address) { err = "node did not echo our coinbase_address"; return false; }
+	if (g_pool_mode) {
+		if (r.num("gozero_pool") != 1) { err = "not a Gozero pool template (gozero_pool != 1)"; return false; }
+		t.pool_address = r.str("gozero_pool_address");
+		t.workid = r.str("workid");
+		if (t.pool_address.rfind("rg1q", 0) != 0 || r.str("coinbase_address") != t.pool_address) { err = "pool coinbase address missing or inconsistent"; return false; }
+		if (t.workid.empty()) { err = "pool template without workid"; return false; }
+		t.expires_s = (double)r.num("expires", 120);
+	} else if (r.str("coinbase_address") != g_cfg.address) { err = "node did not echo our coinbase_address"; return false; }
 	const JVal *mut = r.get("mutable");
 	bool time_mut = false;
 	if (mut && mut->t == JVal::ARR) for (auto &m : mut->a) if (m.s == "time") time_mut = true;
@@ -283,6 +331,18 @@ static bool build_template(const JVal &r, Template &t, std::string &err)
 	if (target_hex(t.target) != r.str("target")) { err = "target does not match bits (" + target_hex(t.target) + " vs " + r.str("target") + ")"; return false; }
 	int64_t curtime = r.num("curtime"), mintime = r.num("mintime");
 	t.maxtime = r.num("maxtime", curtime + 7000);
+	memcpy(t.gpu_target, t.target, sizeof(t.target));
+	if (g_pool_mode) {
+		std::vector<uint8_t> st;
+		if (!from_hex(r.str("gozero_share_target"), st) || st.size() != 32) { err = "bad gozero_share_target"; return false; }
+		uint32_t w[8];
+		for (int i = 0; i < 8; i++) w[i] = (uint32_t)st[31 - 4 * i] | (uint32_t)st[30 - 4 * i] << 8 | (uint32_t)st[29 - 4 * i] << 16 | (uint32_t)st[28 - 4 * i] << 24;
+		/* the share target must be at least as easy as the block target */
+		int cmp = 0;
+		for (int i = 7; i >= 0 && !cmp; i--) if (w[i] != t.target[i]) cmp = w[i] > t.target[i] ? 1 : -1;
+		if (cmp < 0) { err = "share target harder than the block target"; return false; }
+		memcpy(t.gpu_target, w, sizeof(w));
+	}
 	t.base_time = std::max(curtime, mintime);
 
 	/* coinbase: copy the node bytes, check its txid */
@@ -308,7 +368,7 @@ static bool build_template(const JVal &r, Template &t, std::string &err)
 	}
 	merkle_root(leaves, mroot);
 	uint8_t node_root[32];
-	if (!hex32_rev(r.str("merkleroot"), node_root) || memcmp(node_root, mroot, 32)) { err = "merkle root mismatch with the node"; return false; }
+	if (!hex32_rev(r.str("merkleroot"), node_root) || memcmp(node_root, mroot, 32)) { err = "merkle root mismatch with the template"; return false; }
 	t.ntx = txs->a.size();
 	t.txs_hex = hex;
 
@@ -324,7 +384,7 @@ static bool build_template(const JVal &r, Template &t, std::string &err)
 static bool fetch_template(std::shared_ptr<Template> &out, std::string &err)
 {
 	JVal r;
-	if (!g_rpc.call("getblocktemplate", gbt_params(), r, err, 20)) return false;
+	if (!(g_pool_mode ? g_pool : g_rpc).call("getblocktemplate", gbt_params(), r, err, 20)) return false;
 	auto t = std::make_shared<Template>();
 	if (!build_template(r, *t, err)) return false;
 	t->fetched_at = now_s();
@@ -343,7 +403,10 @@ static void template_thread()
 			g_last_ok = now_s();
 			if (!last_err.empty()) { LOG("node OK again"); last_err.clear(); }
 			auto cur = current_tpl();
-			if (!cur || cur->prevhash != t->prevhash || cur->longpollid != t->longpollid) {
+			bool change = !cur || cur->prevhash != t->prevhash;
+			if (!change && g_pool_mode) change = now_s() - cur->fetched_at > std::min((double)g_cfg.tpl_max_age_s, cur->expires_s * 0.75);
+			else if (!change) change = cur->longpollid != t->longpollid;
+			if (change) {
 				bool new_block = !cur || cur->prevhash != t->prevhash;
 				t->id = g_tpl_id + 1;
 				{
@@ -351,16 +414,19 @@ static void template_thread()
 					g_tpl = t;
 				}
 				g_tpl_id = t->id;
-				if (new_block)
+				if (new_block && g_pool_mode)
+					LOG("new pool job: height %lld, diff %.1f, share diff %.4f, %zu tx, prev %s",
+						(long long)t->height, target_difficulty(t->target), target_difficulty(t->gpu_target), t->ntx, t->prevhash.substr(0, 16).c_str());
+				else if (new_block)
 					LOG("new block template: height %lld, diff %.1f, %zu tx, reward %.8f ORU, prev %s",
 						(long long)t->height, target_difficulty(t->target), t->ntx, t->coinbasevalue / 1e8, t->prevhash.substr(0, 16).c_str());
 			}
 		} else {
-			if (err != last_err || now_s() - last_err_log > 60) { LOG("getblocktemplate failed: %s", err.c_str()); last_err_log = now_s(); }
+			if (err != last_err || now_s() - last_err_log > 60) { LOG("getblocktemplate (%s) failed: %s", g_pool_mode ? "pool" : "node", err.c_str()); last_err_log = now_s(); }
 			last_err = err;
 		}
 		std::unique_lock<std::mutex> lk(g_poll_m);
-		g_poll_cv.wait_for(lk, std::chrono::milliseconds(g_cfg.poll_ms), [] { return g_poll_now.load() || g_stop.load(); });
+		g_poll_cv.wait_for(lk, std::chrono::milliseconds(g_pool_mode ? g_cfg.pool_poll_ms : g_cfg.poll_ms), [] { return g_poll_now.load() || g_stop.load(); });
 		g_poll_now = false;
 	}
 }
@@ -369,6 +435,26 @@ static void poll_now()
 {
 	g_poll_now = true;
 	g_poll_cv.notify_all();
+}
+
+/* pool mode: the local node sees new blocks within ~1 s; ask the pool for new work at once */
+static void tip_watch_thread()
+{
+	std::string last, err;
+	bool warned = false;
+	while (!g_stop) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(g_cfg.tip_watch_ms));
+		JVal r;
+		if (!g_rpc.call("getbestblockhash", "[]", r, err, 5)) {
+			if (!warned) { LOG("tip watch: local node unavailable (%s), pool polling only", err.c_str()); warned = true; }
+			std::this_thread::sleep_for(std::chrono::seconds(10));
+			continue;
+		}
+		if (warned) { LOG("tip watch: local node OK"); warned = false; }
+		auto cur = current_tpl();
+		if (r.t == JVal::STR && !last.empty() && r.s != last && cur && cur->prevhash != r.s) poll_now();
+		if (r.t == JVal::STR) last = r.s;
+	}
 }
 
 /* ------------------------------------------------------------------ statistics */
@@ -383,6 +469,8 @@ struct GpuStat {
 };
 static std::vector<std::unique_ptr<GpuStat>> g_stats;
 static std::atomic<uint64_t> g_blocks_ok{ 0 }, g_blocks_rej{ 0 };
+static std::atomic<uint64_t> g_sh_ok{ 0 }, g_sh_rej{ 0 }, g_sh_stale{ 0 }, g_sh_blocks{ 0 };
+static double g_start_s = 0;
 
 /* ------------------------------------------------------------------ submission */
 
@@ -409,6 +497,84 @@ static void submit_block(Template &t, const uint8_t header[80], int gpu)
 		LOG("BLOCK REJECTED: %s", ok ? (r.t == JVal::STR ? r.s.c_str() : "unexpected answer") : err.c_str());
 	}
 	poll_now();
+}
+
+/* ------------------------------------------------------------------ pool shares */
+
+struct Share {
+	std::shared_ptr<Template> t;
+	uint8_t header[80];
+	int gpu;
+	bool block;
+};
+static std::mutex g_shq_m;
+static std::condition_variable g_shq_cv;
+static std::deque<Share> g_shq;
+
+static void queue_share(const std::shared_ptr<Template> &t, const uint8_t header[80], int gpu, bool block)
+{
+	Share s;
+	s.t = t; memcpy(s.header, header, 80); s.gpu = gpu; s.block = block;
+	{
+		std::lock_guard<std::mutex> g(g_shq_m);
+		if (g_shq.size() > 256) g_shq.pop_front();       /* pool unreachable for a long time */
+		g_shq.push_back(s);
+	}
+	g_shq_cv.notify_one();
+}
+
+static void share_thread()
+{
+	while (!g_stop) {
+		Share s;
+		{
+			std::unique_lock<std::mutex> lk(g_shq_m);
+			g_shq_cv.wait_for(lk, std::chrono::milliseconds(500), [] { return !g_shq.empty() || g_stop.load(); });
+			if (g_shq.empty()) continue;
+			s = g_shq.front();
+			g_shq.pop_front();
+		}
+		auto cur = current_tpl();
+		if (!s.block && ((cur && cur->prevhash != s.t->prevhash) || now_s() - s.t->fetched_at > s.t->expires_s - 5)) {
+			g_sh_stale++;                 /* found on a previous block or an expired job: do not send */
+			continue;
+		}
+		std::string hex = to_hex(s.header, 80) + s.t->txs_hex;
+		JVal r;
+		std::string err;
+		bool ok = false;
+		for (int attempt = 0; attempt < 3 && !ok; attempt++) {
+			ok = g_pool.call("submitblock", "[\"" + hex + "\",{\"workid\":" + json_escape(s.t->workid) + "}]", r, err, 30);
+			if (!ok && err.rfind("RPC error", 0) == 0) break;      /* answered with an error: no retry */
+			if (!ok) std::this_thread::sleep_for(std::chrono::seconds(2));
+		}
+		if (ok && r.is_null()) {
+			uint64_t n = ++g_sh_ok;
+			if (s.block) {
+				g_sh_blocks++;
+				uint8_t bh[32];
+				sha256d(bh, s.header, 80);
+				LOG("BLOCK found for the pool by GPU %d: height %lld, hash %s (share accepted)", s.gpu, (long long)s.t->height, to_hex_rev(bh, 32).c_str());
+			} else {
+				LOG("share accepted (GPU %d) [%llu ok / %llu rejected / %llu stale]", s.gpu, (unsigned long long)n,
+					(unsigned long long)g_sh_rej.load(), (unsigned long long)g_sh_stale.load());
+			}
+		} else {
+			std::string why = ok ? (r.t == JVal::STR ? r.s : "unexpected answer") : err;
+			std::string lw = why;
+			for (auto &c : lw) c = (char)tolower((unsigned char)c);
+			if (lw.find("stale") != std::string::npos || lw.find("duplicate") != std::string::npos ||
+			    lw.find("inconclusive") != std::string::npos || lw.find("expired") != std::string::npos ||
+			    lw.find("prevblk") != std::string::npos || lw.find("unknown work") != std::string::npos) {
+				g_sh_stale++;
+				LOG("share stale (GPU %d): %s", s.gpu, why.c_str());
+			} else {
+				g_sh_rej++;
+				LOG("share REJECTED (GPU %d)%s: %s", s.gpu, s.block ? " [block-level]" : "", why.c_str());
+			}
+			poll_now();
+		}
+	}
 }
 
 /* ------------------------------------------------------------------ GPU worker */
@@ -464,7 +630,7 @@ static void gpu_thread(int idx, int dev)
 			uint32_t found[RG_MAX_FOUND];
 			int nf = 0;
 			float ms = 0;
-			int e = rg_scan(ctx, header, t->target, (uint32_t)start, batch, found, RG_MAX_FOUND, &nf, &ms);
+			int e = rg_scan(ctx, header, t->gpu_target, (uint32_t)start, batch, found, RG_MAX_FOUND, &nf, &ms);
 			if (e) { LOG("GPU %d CUDA error: %s", dev, rg_error_string(e)); fflush(stdout); _Exit(5); }
 			st.hashes += batch;
 			st.last_ms = ms;
@@ -475,12 +641,18 @@ static void gpu_thread(int idx, int dev)
 				rgr_pow_ref(d, hh);
 				/* the GPU only compared the 64 high bits: recheck them, then all 256 */
 				uint2 hi = make_uint2(get_le32(d + 24), get_le32(d + 28));
-				if (!rgr_hi_le(hi, make_uint2(t->target[6], t->target[7]))) {
+				if (!rgr_hi_le(hi, make_uint2(t->gpu_target[6], t->gpu_target[7]))) {
 					st.wrong++;
 					LOG("GPU %d WRONG candidate (nonce %08x): hardware error, check clocks", dev, found[i]);
 					continue;
 				}
-				if (rgr_digest_le_target(d, t->target)) {
+				if (g_pool_mode) {
+					if (rgr_digest_le_target(d, t->gpu_target)) {
+						const bool block = rgr_digest_le_target(d, t->target);
+						if (block) st.found++;
+						queue_share(t, hh, dev, block);
+					}
+				} else if (rgr_digest_le_target(d, t->target)) {
 					st.found++;
 					submit_block(*t, hh, dev);
 				}
@@ -751,6 +923,13 @@ static void stats_thread()
 		double eta_h = (diff > 0 && tot > 0) ? diff * 4294967296.0 / tot / 3600.0 : 0;
 		uint64_t wrong = 0;
 		for (auto &s : g_stats) wrong += s->wrong;
+		if (g_pool_mode) {
+			double el = now_s() - g_start_s;
+			double eff = el > 0 ? g_sh_ok.load() * g_cfg.share_work / el : 0;
+			LOG("%.1f MH/s total (%s) | pool: shares %llu ok, %llu rejected, %llu stale, %.0f MH/s from shares | height %lld diff %.1f | pool blocks by us %llu | hw errors %llu",
+				tot / 1e6, per.c_str(), (unsigned long long)g_sh_ok.load(), (unsigned long long)g_sh_rej.load(), (unsigned long long)g_sh_stale.load(),
+				eff / 1e6, t ? (long long)t->height : 0LL, diff, (unsigned long long)g_sh_blocks.load(), (unsigned long long)wrong);
+		} else
 		LOG("%.1f MH/s total (%s) | height %lld diff %.1f | expected 1 block / %.1f h at this diff | blocks %llu accepted, %llu rejected | hw errors %llu",
 			tot / 1e6, per.c_str(), t ? (long long)t->height : 0LL, diff, eta_h,
 			(unsigned long long)g_blocks_ok.load(), (unsigned long long)g_blocks_rej.load(), (unsigned long long)wrong);
@@ -759,22 +938,51 @@ static void stats_thread()
 
 static int mode_mine()
 {
-	if (g_cfg.address.rfind("rg1q", 0) != 0) { LOG("--address must be a mainnet ORU address starting with rg1q"); return 2; }
+	if (g_pool_mode) {
+		size_t dot = g_cfg.pool_user.find('.');
+		std::string addr = g_cfg.pool_user.substr(0, dot);
+		std::string worker = dot == std::string::npos ? "" : g_cfg.pool_user.substr(dot + 1);
+		bool wok = !worker.empty() && worker.size() <= 48;
+		for (char c : worker) if (!isalnum((unsigned char)c) && c != '_' && c != '-') wok = false;
+		if (addr.rfind("rg1q", 0) != 0 || addr.size() != 42 || !wok) {
+			LOG("--pool-user must be <rg1q address>.<worker> (worker: 1-48 letters, digits, _ or -)");
+			return 2;
+		}
+		if (g_cfg.share_work < 1e6) { LOG("--share-work too small"); return 2; }
+	} else if (g_cfg.address.rfind("rg1q", 0) != 0) { LOG("--address must be a mainnet ORU address starting with rg1q"); return 2; }
 	std::vector<int> devs;
 	if (!open_gpus(devs)) return 3;
-	LOG("RgrMiner %s, solo on %s:%d, payout %s, %zu GPU(s), tpb %d, batch 2^%d",
-		RGR_VERSION, g_cfg.rpc_host.c_str(), g_cfg.rpc_port, g_cfg.address.c_str(), devs.size(), g_cfg.tpb, g_cfg.batch_log2);
+	g_start_s = now_s();
+	if (g_pool_mode)
+		LOG("RgrMiner %s, POOL %s://%s%s as %s, share work %.3g, %zu GPU(s), tpb %d, batch 2^%d",
+			RGR_VERSION, g_pool.tls ? "https" : "http", g_pool.host.c_str(), g_pool.path.c_str(), g_cfg.pool_user.c_str(),
+			g_cfg.share_work, devs.size(), g_cfg.tpb, g_cfg.batch_log2);
+	else
+		LOG("RgrMiner %s, solo on %s:%d, payout %s, %zu GPU(s), tpb %d, batch 2^%d",
+			RGR_VERSION, g_cfg.rpc_host.c_str(), g_cfg.rpc_port, g_cfg.address.c_str(), devs.size(), g_cfg.tpb, g_cfg.batch_log2);
+	std::thread shq, tw;
+	if (g_pool_mode) {
+		shq = std::thread(share_thread);
+		if (g_cfg.tip_watch_ms > 0 && !g_rpc.user.empty()) tw = std::thread(tip_watch_thread);
+	}
 	std::thread tt(template_thread);
 	for (int i = 0; i < 100 && !current_tpl(); i++) std::this_thread::sleep_for(std::chrono::milliseconds(100));
 	std::vector<std::thread> th;
 	for (size_t i = 0; i < devs.size(); i++) th.emplace_back(gpu_thread, (int)i, devs[i]);
 	std::thread st(stats_thread);
+	if (g_cfg.run_s > 0)
+		std::thread([] { for (int i = 0; i < g_cfg.run_s * 10 && !g_stop; i++) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+			LOG("run-seconds reached, stopping"); g_stop = true; }).detach();
 	for (auto &t : th) t.join();
 	g_stop = true;
 	poll_now();
 	tt.join();
 	st.join();
-	return 1;   /* the GPU threads never end normally: let the .bat restart us */
+	g_shq_cv.notify_all();
+	if (shq.joinable()) shq.join();
+	if (tw.joinable()) tw.join();
+	if (g_pool_mode) LOG("pool session end: shares %llu ok, %llu rejected, %llu stale", (unsigned long long)g_sh_ok.load(), (unsigned long long)g_sh_rej.load(), (unsigned long long)g_sh_stale.load());
+	return g_cfg.run_s > 0 ? 0 : 1;   /* the GPU threads never end normally: let the .bat restart us */
 }
 
 /* ------------------------------------------------------------------ main */
@@ -824,6 +1032,17 @@ int main(int argc, char **argv)
 	}
 	if (g_cfg.mode == "test") return mode_test();
 	if (g_cfg.mode == "bench") return mode_bench();
+	if (!g_cfg.pool_url.empty()) {
+		std::string err;
+		g_pool_mode = true;
+		g_pool.name = "pool";
+		g_pool.cafile = g_cfg.ca_file;
+		g_pool.user = g_cfg.pool_user;
+		g_pool.pass = g_cfg.pool_pass;
+		if (!g_pool.set_url(g_cfg.pool_url, err)) { LOG("--pool-url: %s", err.c_str()); return 2; }
+		if (g_cfg.mode != "mine") { LOG("pool mode only mines (use --test / --bench without pool settings)"); return 2; }
+		return mode_mine();
+	}
 	if (g_cfg.address.empty() && g_cfg.mode != "check") { LOG("--address is required"); return 2; }
 	if (g_cfg.mode == "propose") return mode_propose();
 	if (g_cfg.mode == "check") return mode_check_chain();

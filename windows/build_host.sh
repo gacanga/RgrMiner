@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# build_host.sh - builds <dir>/rgrminer.exe (MSYS2 MINGW64 g++), linked directly against
-# <dir>/rgpu.dll.  Log: logs/build_host.log.
+# build_host.sh - builds <dir>/rgrminer.exe (MSYS2 MINGW64 g++ + OpenSSL for the HTTPS pool mode),
+# linked directly against <dir>/rgpu.dll; copies ca-bundle.crt.  Log: logs/build_host.log.
 # RG_HOST_ARCH overrides -march=native (release: "-march=x86-64 -mtune=generic").
 set -u
 cd "$(dirname "$0")/.."
@@ -14,17 +14,22 @@ if [ ! -f "$OUT/rgpu.dll" ]; then
     echo "ERROR: $OUT/rgpu.dll missing" | tee -a "$LOG"
     exit 1
 fi
+if [ ! -f /mingw64/include/openssl/ssl.h ]; then
+    echo "ERROR: OpenSSL headers missing (/mingw64/include/openssl). Package: mingw-w64-x86_64-openssl" | tee -a "$LOG"
+    exit 1
+fi
 ARCH="${RG_HOST_ARCH:--march=native}"
 FLAGS="-O2 $ARCH -std=gnu++17 -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -Wno-unknown-pragmas -Isrc -Igpu"
-if g++ $FLAGS -o "$OUT/rgrminer.exe" src/main.cpp "$OUT/rgpu.dll" -static -lws2_32 -pthread >> "$LOG" 2>&1; then
+if g++ $FLAGS -o "$OUT/rgrminer.exe" src/main.cpp "$OUT/rgpu.dll" -static -lssl -lcrypto -lws2_32 -lcrypt32 -lgdi32 -luser32 -ladvapi32 -lbcrypt -pthread >> "$LOG" 2>&1; then
     echo "static link OK" >> "$LOG"
 else
     echo "static link failed, trying dynamic link" >> "$LOG"
-    if ! g++ $FLAGS -o "$OUT/rgrminer.exe" src/main.cpp "$OUT/rgpu.dll" -lws2_32 -pthread >> "$LOG" 2>&1; then
+    if ! g++ $FLAGS -o "$OUT/rgrminer.exe" src/main.cpp "$OUT/rgpu.dll" -lssl -lcrypto -lws2_32 -lcrypt32 -pthread >> "$LOG" 2>&1; then
         echo "[$(date '+%F %T')] HOST BUILD FAILED" | tee -a "$LOG"
         exit 1
     fi
     echo "dynamic link OK (needs C:\\msys64\\mingw64\\bin in PATH)" >> "$LOG"
 fi
+if [ -f /mingw64/etc/ssl/certs/ca-bundle.crt ]; then cp -f /mingw64/etc/ssl/certs/ca-bundle.crt "$OUT/"; fi
 echo "[$(date '+%F %T')] host OK" | tee -a "$LOG"
 exit 0
